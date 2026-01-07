@@ -4,124 +4,163 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# La clave vive en las variables de entorno de Render
+# --- CONFIGURACIÓN ---
+# Las claves las pondrás en RENDER (Environment Variables)
 WHOP_API_KEY = os.environ.get("WHOP_API_KEY", "")
+# Datos de Upstash (Base de datos gratis)
+UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "")
+UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
+# Tu clave secreta para desvincular manualmente (pon la que quieras en Render)
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "PrendoElMejor1234")
 
-def get_headers():
+# --- HELPERS ---
+def get_whop_headers():
     token = WHOP_API_KEY.replace("Bearer ", "").strip()
-    return {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
+    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+def db_get(key):
+    """Lee un valor de la base de datos Upstash"""
+    if not UPSTASH_URL: return None
+    try:
+        # Usamos la API REST de Upstash para leer
+        url = f"{UPSTASH_URL}/get/{key}"
+        headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
+        r = requests.get(url, headers=headers, timeout=5)
+        data = r.json()
+        # Upstash devuelve: {"result": "valor_guardado"} o {"result": null}
+        return data.get("result") 
+    except:
+        return None
+
+def db_set_nx(key, value):
+    """
+    Guarda SOLO si no existe (SET NX).
+    Devuelve True si se guardó, False si ya existía (estaba bloqueado).
+    """
+    if not UPSTASH_URL: return False
+    try:
+        # Comando SET con opción NX (Not Exists)
+        url = f"{UPSTASH_URL}/set/{key}/{value}?nx"
+        headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
+        r = requests.get(url, headers=headers, timeout=5)
+        data = r.json()
+        # Si guardó, result es "OK". Si ya existía, result es null.
+        return data.get("result") == "OK"
+    except:
+        return False
+
+def db_del(key):
+    """Borra un valor (Para el Admin)"""
+    if not UPSTASH_URL: return False
+    try:
+        url = f"{UPSTASH_URL}/del/{key}"
+        headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
+        requests.get(url, headers=headers, timeout=5)
+        return True
+    except:
+        return False
+
+# --- RUTAS ---
 
 @app.route('/')
 def home():
-    return "Servidor PrendeClips V2 (Modo Paranoico)"
-
-def obtener_info_real(license_key, hwid):
-    """
-    Función auxiliar que hace el TRIPLE chequeo para encontrar la metadata.
-    Devuelve: (EsValida, CanalGuardado, MembershipID)
-    """
-    # Paso 1: Validar para obtener el ID de membresía y metadata básica
-    url_validate = f"https://api.whop.com/api/v2/memberships/{license_key}/validate_license"
-    payload = {"metadata": {"hwid": hwid}}
-    
-    try:
-        r = requests.post(url_validate, json=payload, headers=get_headers(), timeout=10)
-        
-        if r.status_code not in [200, 201]:
-            return False, None, None
-            
-        data = r.json()
-        is_valid = data.get("valid", False)
-        mem_id = data.get("id") # ID real de la membresía (mem_...)
-        
-        # Intentamos leer el canal de la respuesta de validación
-        meta = data.get("metadata", {})
-        canal = meta.get("twitch_channel")
-        
-        # Paso 2: Si es válida pero no vemos canal, consultamos la ID directa (Más fiable)
-        if is_valid and not canal and mem_id:
-            url_get = f"https://api.whop.com/api/v2/memberships/{mem_id}"
-            r2 = requests.get(url_get, headers=get_headers(), timeout=5)
-            if r2.status_code == 200:
-                data2 = r2.json()
-                meta2 = data2.get("metadata", {})
-                canal = meta2.get("twitch_channel")
-        
-        return is_valid, canal, mem_id
-
-    except Exception as e:
-        print(f"Error obteniendo info: {e}")
-        return False, None, None
+    return "Servidor PrendeClips con DB Persistente 🚀"
 
 @app.route('/validar', methods=['POST'])
 def validar():
+    """Valida en Whop y consulta el canal BLINDADO en nuestra DB"""
     data = request.json
-    key = data.get('license_key')
+    license_key = data.get('license_key')
     hwid = data.get('hwid')
 
-    if not key or not hwid:
+    if not license_key or not hwid:
         return jsonify({"valid": False, "error": "Faltan datos"}), 400
 
-    is_valid, canal, _ = obtener_info_real(key, hwid)
+    # 1. Validar validez con Whop (Esto siempre es necesario para ver si paga)
+    url_whop = f"https://api.whop.com/api/v2/memberships/{license_key}/validate_license"
     
-    if is_valid is False:
-        # Si obtener_info_real falló, puede ser inválida o error 404
-        return jsonify({"valid": False, "error": "Licencia no válida o no encontrada"}), 200 # Devolvemos 200 con valid:False para que el cliente lo gestione
+    try:
+        r = requests.post(url_whop, json={"metadata": {"hwid": hwid}}, headers=get_whop_headers(), timeout=10)
         
-    return jsonify({
-        "valid": is_valid,
-        "linked_channel": canal,
-        "status": 200
-    })
+        if r.status_code in [200, 201]:
+            whop_data = r.json()
+            is_valid = whop_data.get("valid", False)
+            
+            linked_channel = None
+            if is_valid:
+                # 2. AQUÍ ESTÁ EL TRUCO: No miramos Whop, miramos NUESTRA DB
+                # Buscamos si esta licencia ya tiene dueño en Upstash
+                linked_channel = db_get(f"binding:{license_key}")
+
+            return jsonify({
+                "valid": is_valid,
+                "linked_channel": linked_channel, # Devolvemos lo que hay en DB (o None si es virgen)
+                "status": r.status_code
+            })
+        
+        elif r.status_code == 404:
+            return jsonify({"valid": False, "error": "Licencia no existe"}), 404
+        else:
+            return jsonify({"valid": False, "error": f"Whop Error: {r.status_code}"}), r.status_code
+
+    except Exception as e:
+        return jsonify({"valid": False, "error": str(e)}), 500
 
 @app.route('/vincular', methods=['POST'])
 def vincular():
+    """Intenta bloquear la licencia a un canal en la DB"""
     data = request.json
-    key = data.get('license_key')
-    canal_nuevo = data.get('canal')
+    license_key = data.get('license_key')
+    canal_nuevo = data.get('canal', '').strip().lower()
     hwid = data.get('hwid')
 
-    if not all([key, canal_nuevo, hwid]):
+    if not all([license_key, canal_nuevo, hwid]):
         return jsonify({"success": False, "error": "Faltan datos"}), 400
 
-    # 1. 🔒 INSPECCIÓN PROFUNDA
-    is_valid, canal_existente, mem_id = obtener_info_real(key, hwid)
+    # 1. Intentamos guardar con "SET NX" (Solo guardar si está vacía)
+    guardado_ok = db_set_nx(f"binding:{license_key}", canal_nuevo)
 
-    if not is_valid:
-        return jsonify({"success": False, "error": "No se puede vincular una licencia inválida"}), 403
-
-    # 2. 🔒 EL CANDADO
-    if canal_existente and canal_existente.strip():
-        # Ya hay un canal. Comparamos (ignorando mayúsculas)
-        if canal_existente.lower().strip() != canal_nuevo.lower().strip():
-            print(f"BLOQUEO: {canal_existente} vs {canal_nuevo}")
+    if guardado_ok:
+        # ¡Éxito! Era virgen y ahora es tuya.
+        # (Opcional) También lo guardamos en Whop por si quieres verlo en su panel,
+        # pero la autoridad la tiene Upstash.
+        try:
+            url_whop = f"https://api.whop.com/api/v2/memberships/{license_key}"
+            requests.post(url_whop, json={"metadata": {"twitch_channel": canal_nuevo}}, headers=get_whop_headers(), timeout=5)
+        except: pass # Si falla Whop da igual, tenemos Upstash
+        
+        return jsonify({"success": True})
+    
+    else:
+        # Falló al guardar -> YA EXISTÍA ALGO.
+        # Leemos qué canal era para ver si es el mismo o un intento de hackeo.
+        canal_existente = db_get(f"binding:{license_key}")
+        
+        if canal_existente == canal_nuevo:
+            return jsonify({"success": True}) # Es el mismo, todo ok.
+        else:
             return jsonify({
                 "success": False, 
-                "error": f"🔒 ERROR CRÍTICO: Esta licencia YA pertenece a '{canal_existente}'. No puedes cambiarla."
-            }), 200 # Devolvemos 200 pero success False para que el cliente muestre el mensaje
+                "error": f"🔒 BLOQUEADO: Esta licencia ya pertenece a '{canal_existente}'."
+            }), 409
 
-    # 3. GUARDAR (Usando el ID real si lo tenemos, es más seguro)
-    target_id = mem_id if mem_id else key
-    url_update = f"https://api.whop.com/api/v2/memberships/{target_id}"
+# --- RUTA ADMIN PARA DESVINCULAR ---
+@app.route('/admin/reset', methods=['POST'])
+def admin_reset():
+    """
+    Ruta secreta para borrar un vínculo si un cliente llora.
+    Headers: { "X-Admin-Secret": "tu_clave_secreta" }
+    Body: { "license_key": "XXX" }
+    """
+    secret = request.headers.get("X-Admin-Secret")
+    if secret != ADMIN_SECRET:
+        return jsonify({"error": "Unauthorized"}), 401
     
-    payload = {
-        "metadata": {
-            "twitch_channel": canal_nuevo,
-            "hwid": hwid
-        }
-    }
-
-    try:
-        r = requests.post(url_update, json=payload, headers=get_headers(), timeout=10)
-        if r.status_code in [200, 201]:
-            return jsonify({"success": True})
-        else:
-            return jsonify({"success": False, "error": f"Whop Error: {r.status_code}"}), 500
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+    key = request.json.get("license_key")
+    if db_del(f"binding:{key}"):
+        return jsonify({"success": True, "message": f"Licencia {key} reseteada."})
+    else:
+        return jsonify({"success": False, "error": "No se pudo borrar"}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
